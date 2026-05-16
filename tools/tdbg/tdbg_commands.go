@@ -321,7 +321,7 @@ func newAdminScheduleCommands(clientFactory ClientFactory) []*cli.Command {
 		},
 		{
 			Name:  "check",
-			Usage: "Check unpaused CHASM schedules for missing tasks (GeneratorTask, SchedulerIdleTask)",
+			Usage: "Check unpaused CHASM schedules for missing tasks (GeneratorTask, SchedulerIdleTask) and report missed runs since the generator high watermark",
 			Flags: []cli.Flag{
 				&cli.StringFlag{
 					Name:    FlagScheduleID,

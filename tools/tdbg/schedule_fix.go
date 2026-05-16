@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -11,22 +12,19 @@ import (
 
 	"github.com/urfave/cli/v2"
 	commonpb "go.temporal.io/api/common/v1"
-	enumspb "go.temporal.io/api/enums/v1"
 	schedulepb "go.temporal.io/api/schedule/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/api/adminservice/v1"
 	"go.temporal.io/server/chasm"
-	schedulerpb "go.temporal.io/server/chasm/lib/scheduler/gen/schedulerpb/v1"
 	"go.temporal.io/server/common/codec"
 	"go.temporal.io/server/common/log"
-	"go.temporal.io/server/common/persistence/serialization"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
-	fqnGeneratorComponent  = "scheduler.generator"
-	fqnSchedulerComponent  = "scheduler.scheduler"
-	defaultFixParallelism  = 5
+	fqnGeneratorComponent = "scheduler.generator"
+	fqnSchedulerComponent = "scheduler.scheduler"
+	defaultFixParallelism = 5
 )
 
 type scheduleFixResult struct {
@@ -159,10 +157,10 @@ func fixSchedule(
 
 	// Single DescribeMutableState call to get everything: pause status, notes,
 	// policies, task presence, and generator high watermark.
-	var inspection *scheduleInspection
+	var parsed *parsedScheduler
 	err := retryOnResourceExhausted(c, namespace, scheduleID, "inspect", func() error {
 		var inspectErr error
-		inspection, inspectErr = inspectSchedule(c, adminClient, registry, namespace, scheduleID)
+		parsed, inspectErr = inspectSchedule(c, adminClient, registry, namespace, scheduleID)
 		return inspectErr
 	})
 	if err != nil {
@@ -172,49 +170,49 @@ func fixSchedule(
 	}
 
 	hwmStr := "<nil>"
-	if inspection.highWatermark != nil {
-		hwmStr = inspection.highWatermark.AsTime().UTC().Format(time.RFC3339)
+	if parsed.highWatermark != nil {
+		hwmStr = parsed.highWatermark.AsTime().UTC().Format(time.RFC3339)
 	}
-	specJSON, _ := codec.NewJSONPBEncoder().Encode(inspection.spec)
+	specJSON, _ := codec.NewJSONPBEncoder().Encode(parsed.spec)
 	fmt.Fprintf(c.App.ErrWriter, "[%s/%s] paused=%v notes=%q catchupWindow=%s overlapPolicy=%s hwm=%s hasGenerator=%v hasIdle=%v taskFQNs=%v spec=%s\n",
 		namespace, scheduleID,
-		inspection.isPaused,
-		inspection.notes,
-		inspection.catchupWindow,
-		inspection.overlapPolicy,
+		parsed.isPaused,
+		parsed.notes,
+		parsed.catchupWindow,
+		parsed.overlapPolicy,
 		hwmStr,
-		inspection.checkResult.HasGenerator,
-		inspection.checkResult.HasIdle,
-		inspection.checkResult.TaskFQNs,
+		parsed.hasGenerator,
+		parsed.hasIdle,
+		parsed.taskFQNs,
 		specJSON,
 	)
 
-	result.Paused = inspection.isPaused
-	result.Notes = inspection.notes
-	result.HasGenerator = inspection.checkResult.HasGenerator
-	result.HasIdle = inspection.checkResult.HasIdle
-	result.TaskFQNs = inspection.checkResult.TaskFQNs
+	result.Paused = parsed.isPaused
+	result.Notes = parsed.notes
+	result.HasGenerator = parsed.hasGenerator
+	result.HasIdle = parsed.hasIdle
+	result.TaskFQNs = parsed.taskFQNs
 	result.Spec = json.RawMessage(specJSON)
 
 	// If paused by someone else, skip.
-	if inspection.isPaused {
+	if parsed.isPaused {
 		result.Action = "skipped-paused"
-		result.Reason = fmt.Sprintf("already paused (notes: %q)", inspection.notes)
+		result.Reason = fmt.Sprintf("already paused (notes: %q)", parsed.notes)
 		return result
 	}
 
 	// Check task presence (unless --force).
 	if !c.Bool("force") {
-		if inspection.checkResult.HasGenerator || inspection.checkResult.HasIdle {
+		if parsed.hasGenerator || parsed.hasIdle {
 			result.Action = "skipped-not-missing"
 			return result
 		}
 	}
 
 	now := time.Now().UTC()
-	catchupWindow := inspection.catchupWindow
-	overlapPolicy := inspection.overlapPolicy
-	highWatermark := inspection.highWatermark
+	catchupWindow := parsed.catchupWindow
+	overlapPolicy := parsed.overlapPolicy
+	highWatermark := parsed.highWatermark
 
 	if highWatermark != nil {
 		result.HighWatermark = highWatermark.AsTime().UTC().Format(time.RFC3339)
@@ -286,8 +284,8 @@ func fixSchedule(
 }
 
 const (
-	fixMaxRetries      = 3
-	fixInitialBackoff  = 2 * time.Second
+	fixMaxRetries     = 3
+	fixInitialBackoff = 2 * time.Second
 )
 
 func retryOnResourceExhausted(c *cli.Context, namespace, scheduleID, op string, fn func() error) error {
@@ -302,20 +300,10 @@ func retryOnResourceExhausted(c *cli.Context, namespace, scheduleID, op string, 
 		}
 		fmt.Fprintf(c.App.ErrWriter, "[%s/%s] %s: rate limited, retrying in %v (attempt %d/%d)...\n",
 			namespace, scheduleID, op, backoff, attempt, fixMaxRetries)
-		time.Sleep(backoff)
+		time.Sleep(backoff + time.Duration(rand.Int31n(100)*int32(time.Millisecond)))
 		backoff *= 2
 	}
 	return nil
-}
-
-type scheduleInspection struct {
-	isPaused      bool
-	notes         string
-	catchupWindow time.Duration
-	overlapPolicy enumspb.ScheduleOverlapPolicy
-	highWatermark *timestamppb.Timestamp
-	spec          *schedulepb.ScheduleSpec
-	checkResult   scheduleCheckResult
 }
 
 // inspectSchedule uses a single DescribeMutableState call to extract pause
@@ -326,7 +314,7 @@ func inspectSchedule(
 	registry *chasm.Registry,
 	namespace string,
 	scheduleID string,
-) (*scheduleInspection, error) {
+) (*parsedScheduler, error) {
 	ctx, cancel := newContext(c)
 	defer cancel()
 
@@ -341,81 +329,5 @@ func inspectSchedule(
 		return nil, fmt.Errorf("describe mutable state: %w", err)
 	}
 
-	chasmNodes := resp.GetDatabaseMutableState().GetChasmNodes()
-	if len(chasmNodes) == 0 {
-		return nil, fmt.Errorf("no CHASM nodes found")
-	}
-
-	inspection := &scheduleInspection{}
-	inspection.checkResult = scheduleCheckResult{
-		Namespace:  namespace,
-		ScheduleID: scheduleID,
-	}
-
-	var allTaskFQNs []string
-
-	for _, node := range chasmNodes {
-		componentAttr := node.GetMetadata().GetComponentAttributes()
-		if componentAttr == nil {
-			continue
-		}
-
-		componentFQN, _ := registry.ComponentFqnByID(componentAttr.GetTypeId())
-
-		switch componentFQN {
-		case fqnSchedulerComponent:
-			// Decode root scheduler state for pause status, notes, policies.
-			dataBlob := node.GetData()
-			if dataBlob != nil && len(dataBlob.GetData()) > 0 {
-				var schedState schedulerpb.SchedulerState
-				if err := serialization.Decode(dataBlob, &schedState); err == nil {
-					scheduleState := schedState.GetSchedule().GetState()
-					inspection.isPaused = scheduleState.GetPaused()
-					inspection.notes = scheduleState.GetNotes()
-
-					policies := schedState.GetSchedule().GetPolicies()
-					inspection.catchupWindow = policies.GetCatchupWindow().AsDuration()
-					inspection.overlapPolicy = policies.GetOverlapPolicy()
-					inspection.spec = schedState.GetSchedule().GetSpec()
-				}
-			}
-
-		case fqnGeneratorComponent:
-			// Decode generator state for high watermark.
-			dataBlob := node.GetData()
-			if dataBlob != nil && len(dataBlob.GetData()) > 0 {
-				var genState schedulerpb.GeneratorState
-				if err := serialization.Decode(dataBlob, &genState); err == nil {
-					inspection.highWatermark = genState.LastProcessedTime
-				}
-			}
-		}
-
-		// Collect task FQNs from all component nodes.
-		for _, task := range componentAttr.GetSideEffectTasks() {
-			taskFQN, _ := registry.TaskFqnByID(task.GetTypeId())
-			if taskFQN != "" {
-				allTaskFQNs = append(allTaskFQNs, taskFQN)
-			}
-		}
-		for _, task := range componentAttr.GetPureTasks() {
-			taskFQN, _ := registry.TaskFqnByID(task.GetTypeId())
-			if taskFQN != "" {
-				allTaskFQNs = append(allTaskFQNs, taskFQN)
-			}
-		}
-	}
-
-	inspection.checkResult.TaskFQNs = allTaskFQNs
-	for _, taskFQN := range allTaskFQNs {
-		switch taskFQN {
-		case fqnGeneratorTask:
-			inspection.checkResult.HasGenerator = true
-		case fqnSchedulerIdleTask:
-			inspection.checkResult.HasIdle = true
-		}
-	}
-
-	return inspection, nil
+	return parseSchedulerNodes(resp.GetDatabaseMutableState().GetChasmNodes(), registry)
 }
-

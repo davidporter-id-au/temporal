@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,9 +27,9 @@ const (
 	fqnGeneratorTask     = "scheduler.generate"
 	fqnSchedulerIdleTask = "scheduler.idle"
 
-	scheduleCheckPageSize            = 100
-	defaultScheduleCheckParallelism  = 10
-	defaultScheduleCheckNsParallel   = 10
+	scheduleCheckPageSize           = 100
+	defaultScheduleCheckParallelism = 10
+	defaultScheduleCheckNsParallel  = 10
 )
 
 var chasmScheduleBaseQuery = fmt.Sprintf(
@@ -36,14 +37,17 @@ var chasmScheduleBaseQuery = fmt.Sprintf(
 	chasm.SchedulerArchetypeID,
 )
 
-
 type scheduleCheckResult struct {
-	Namespace    string   `json:"namespace"`
-	ScheduleID   string   `json:"scheduleId"`
-	HasGenerator bool     `json:"hasGenerator"`
-	HasIdle      bool     `json:"hasIdle"`
-	Error        string   `json:"error,omitempty"`
-	TaskFQNs     []string `json:"taskFQNs,omitempty"`
+	Namespace           string   `json:"namespace"`
+	ScheduleID          string   `json:"scheduleId"`
+	HasGenerator        bool     `json:"hasGenerator"`
+	HasIdle             bool     `json:"hasIdle"`
+	Error               string   `json:"error,omitempty"`
+	TaskFQNs            []string `json:"taskFQNs,omitempty"`
+	HighWatermark       string   `json:"highWatermark,omitempty"`
+	MissedTotal         int      `json:"missedTotal"`
+	MissedWithinCatchup int      `json:"missedWithinCatchup"`
+	MissedCapped        bool     `json:"missedCapped,omitempty"`
 }
 
 func isMissingTasks(r scheduleCheckResult) bool {
@@ -322,7 +326,7 @@ func checkNamespace(
 		if err != nil {
 			if retryAfter, ok := retryableRateLimit(err); ok {
 				fmt.Fprintf(c.App.ErrWriter, "[%s] Rate limited, retrying in %v...\n", namespace, retryAfter)
-				time.Sleep(retryAfter)
+				time.Sleep(retryAfter * time.Duration(rand.Intn(5)))
 				continue
 			}
 			return fmt.Errorf("listing workflows: %w", err)
@@ -413,7 +417,27 @@ func checkScheduleTasks(
 	ctx, cancel := newContext(c)
 	defer cancel()
 
-	resp, err := adminClient.DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
+	var resp *adminservice.DescribeMutableStateResponse
+	err := retryOnResourceExhausted(c, namespace, scheduleID, "describe-mutable-state", func() error {
+		rsp, err := adminClient.DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
+			Namespace: namespace,
+			Execution: &commonpb.WorkflowExecution{
+				WorkflowId: scheduleID,
+			},
+			Archetype: chasm.SchedulerArchetype,
+		})
+		if err != nil {
+			return err
+		}
+		resp = rsp
+		return nil
+	})
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+
+	resp, err = adminClient.DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
 		Namespace: namespace,
 		Execution: &commonpb.WorkflowExecution{
 			WorkflowId: scheduleID,
@@ -425,42 +449,32 @@ func checkScheduleTasks(
 		return result
 	}
 
-	chasmNodes := resp.GetDatabaseMutableState().GetChasmNodes()
-	if len(chasmNodes) == 0 {
-		result.Error = "no CHASM nodes found"
+	parsed, err := parseSchedulerNodes(resp.GetDatabaseMutableState().GetChasmNodes(), registry)
+	if err != nil {
+		result.Error = err.Error()
 		return result
 	}
 
-	var allTaskFQNs []string
-	for _, node := range chasmNodes {
-		componentAttr := node.GetMetadata().GetComponentAttributes()
-		if componentAttr == nil {
-			continue
-		}
-		for _, task := range componentAttr.GetSideEffectTasks() {
-			fqn, _ := registry.TaskFqnByID(task.GetTypeId())
-			if fqn != "" {
-				allTaskFQNs = append(allTaskFQNs, fqn)
-			}
-		}
-		for _, task := range componentAttr.GetPureTasks() {
-			fqn, _ := registry.TaskFqnByID(task.GetTypeId())
-			if fqn != "" {
-				allTaskFQNs = append(allTaskFQNs, fqn)
-			}
-		}
+	result.HasGenerator = parsed.hasGenerator
+	result.HasIdle = parsed.hasIdle
+	result.TaskFQNs = parsed.taskFQNs
+
+	if parsed.highWatermark == nil || parsed.spec == nil {
+		return result
 	}
 
-	result.TaskFQNs = allTaskFQNs
+	hwmTime := parsed.highWatermark.AsTime()
+	result.HighWatermark = hwmTime.UTC().Format(time.RFC3339)
 
-	for _, fqn := range allTaskFQNs {
-		switch fqn {
-		case fqnGeneratorTask:
-			result.HasGenerator = true
-		case fqnSchedulerIdleTask:
-			result.HasIdle = true
-		}
+	total, withinCatchup, capped, err := countMissedRuns(parsed.spec, hwmTime, time.Now().UTC(), parsed.catchupWindow)
+	if err != nil {
+		// Don't overwrite a primary error; report spec problems via the result fields.
+		result.Error = fmt.Sprintf("count missed runs: %v", err)
+		return result
 	}
+	result.MissedTotal = total
+	result.MissedWithinCatchup = withinCatchup
+	result.MissedCapped = capped
 
 	return result
 }
