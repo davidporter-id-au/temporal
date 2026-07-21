@@ -12,7 +12,7 @@ import (
 	"go.temporal.io/server/common/payload"
 )
 
-func TestKnownIssue_UpdateDuringMigrationIsAtomic(t *testing.T) {
+func TestUpdateDuringMigrationIsAtomic(t *testing.T) {
 	sched, ctx, _ := setupSchedulerForTest(t)
 	visibility := sched.Visibility.Get(ctx)
 	visibility.ReplaceCustomSearchAttributes(ctx, map[string]*commonpb.Payload{
@@ -35,7 +35,7 @@ func TestKnownIssue_UpdateDuringMigrationIsAtomic(t *testing.T) {
 		"a rejected migration-pending update must not mutate visibility state")
 }
 
-func TestKnownIssue_TriggerRejectedDuringMigration(t *testing.T) {
+func TestTriggerRejectedDuringMigration(t *testing.T) {
 	sched, ctx, _ := setupSchedulerForTest(t)
 	_, err := sched.MigrateToWorkflow(ctx, &schedulerpb.MigrateToWorkflowRequest{})
 	require.NoError(t, err)
