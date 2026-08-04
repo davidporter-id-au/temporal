@@ -89,12 +89,35 @@ func AttachDecorator[K comparable](tb testing.TB, key K, decorator func(context.
 	})
 }
 
+// StopTimeout stops the test timeout from being reported against tb when it
+// finishes. It does not change tb's context.
+//
+// Call it once tb's own work is done but its context must stay alive — most
+// importantly a parent test that has handed off to parallel subtests. Go runs a
+// parent's cleanups only after every parallel subtest has finished, so the
+// parent's deadline ends up measuring its children's runtime rather than its
+// own, and a parent that did nothing slow gets reported as having timed out.
+// Each subtest carries its own timeout, so the parent's adds nothing.
+//
+// StopTimeout is a no-op when tb has no test-scoped context.
+func StopTimeout(tb testing.TB) {
+	testContexts.Lock()
+	st, ok := testContexts.byTest[tb]
+	testContexts.Unlock()
+	if !ok {
+		return
+	}
+	st.stopTimeout()
+}
+
 type contextState struct {
 	mu         sync.Mutex
 	ctx        context.Context
 	cancel     context.CancelFunc
 	timeout    time.Duration
 	decorators map[any]struct{}
+	// timeoutStopped suppresses the timeout report; see StopTimeout.
+	timeoutStopped bool
 }
 
 func getContextState(tb testing.TB, timeout time.Duration) *contextState {
@@ -121,12 +144,12 @@ func getContextState(tb testing.TB, timeout time.Duration) *contextState {
 	testContexts.byTest[tb] = st
 
 	tb.Cleanup(func() {
-		err := st.err()
+		timedOut := st.timedOut()
 		st.cancel()
 		testContexts.Lock()
 		delete(testContexts.byTest, tb)
 		testContexts.Unlock()
-		if err == context.DeadlineExceeded {
+		if timedOut {
 			tb.Errorf("test exceeded timeout of %v", st.timeout)
 		}
 		st.release()
@@ -177,6 +200,20 @@ func (s *contextState) err() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ctx.Err()
+}
+
+func (s *contextState) stopTimeout() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.timeoutStopped = true
+}
+
+// timedOut reports whether the context's deadline expired and the timeout is
+// still being tracked.
+func (s *contextState) timedOut() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.timeoutStopped && s.ctx.Err() == context.DeadlineExceeded
 }
 
 func (s *contextState) release() {

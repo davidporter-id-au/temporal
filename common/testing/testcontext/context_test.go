@@ -138,6 +138,68 @@ func TestCleanupCancelsContext(t *testing.T) {
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 }
 
+// A test whose deadline expires is reported as timed out, unless StopTimeout was
+// called first. Asserting on timedOut() rather than the cleanup's Errorf keeps
+// this test from failing itself.
+func TestStopTimeout(t *testing.T) {
+	t.Run("expired deadline is reported", func(t *testing.T) {
+		ctx := For(t, WithTimeout(time.Millisecond))
+		<-ctx.Done()
+
+		st := stateFor(t, t)
+		require.True(t, st.timedOut(), "an expired deadline must be reported as a timeout")
+
+		// Stop it so this test does not fail itself when the cleanup runs.
+		StopTimeout(t)
+		require.False(t, st.timedOut())
+	})
+
+	t.Run("a live context is not a timeout", func(t *testing.T) {
+		For(t, WithTimeout(time.Minute))
+		require.False(t, stateFor(t, t).timedOut())
+	})
+
+	t.Run("no context is a no-op", func(t *testing.T) {
+		StopTimeout(t) // must not panic
+	})
+}
+
+// A parent test is not held to its own deadline while it waits for parallel
+// subtests: Go defers the parent's cleanup until they finish, so the parent's
+// deadline would otherwise expire measuring its children's runtime. This is the
+// shape that failed suites in CI with a spurious "test exceeded timeout".
+func TestParentOfParallelSubtestsIsNotReportedAsTimedOut(t *testing.T) {
+	t.Run("parent", func(t *testing.T) {
+		ctx := For(t, WithTimeout(10*time.Millisecond))
+		parentState := stateFor(t, t)
+
+		// Stand in for parallelsuite.Suite.Run's handoff to subtests.
+		StopTimeout(t)
+
+		// The child runs after the parent's body returns but before the parent's
+		// cleanup, so the parent's state is still live to assert against.
+		t.Run("slow parallel child", func(t *testing.T) {
+			t.Parallel()
+			<-ctx.Done() // outlive the parent's deadline
+
+			require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded,
+				"the parent's deadline must really expire for this test to mean anything")
+			require.False(t, parentState.timedOut(),
+				"a parent waiting on parallel subtests must not be reported as timed out")
+		})
+	})
+}
+
+// stateFor returns the context state registered for key, failing if absent.
+func stateFor(t *testing.T, key testing.TB) *contextState {
+	t.Helper()
+	testContexts.Lock()
+	defer testContexts.Unlock()
+	st, ok := testContexts.byTest[key]
+	require.True(t, ok, "no test context registered")
+	return st
+}
+
 func TestEnvTimeout(t *testing.T) {
 	t.Run("from env", func(t *testing.T) {
 		t.Setenv("TEMPORAL_TEST_TIMEOUT", "10s")

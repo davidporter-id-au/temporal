@@ -139,6 +139,10 @@ func (s *Suite[T]) Context() context.Context {
 func (s *Suite[T]) Run(name string, fn func(T)) bool {
 	pt := s.guardT.T // grab T before sealing
 	s.guardT.markHasSubtests()
+	// The parent's own work is done; from here its lifetime is its subtests'.
+	// Each subtest times out on its own, so holding the parent to its deadline
+	// only produces spurious "test exceeded timeout" failures.
+	testcontext.StopTimeout(pt)
 	return pt.Run(name, func(t *testing.T) {
 		fn(s.copySuite(t, s.runParallel, nil, nil).(T))
 	})
