@@ -54,6 +54,12 @@ func ContextWithTweakables(ctx chasm.Context, tweakables Tweakables) chasm.Conte
 // RecentActionCount exposes the completed-retention limit for tests.
 const RecentActionCount = recentActionCount
 
+// IdleDeadlineForTest exposes the deadline the idle task is armed against and
+// that SchedulerIdleTaskHandler.Validate recomputes.
+func (s *Scheduler) IdleDeadlineForTest(ctx chasm.Context, idleTime time.Duration) time.Time {
+	return s.idleDeadline(ctx, idleTime)
+}
+
 // ApplyCompletedRetention exposes applyCompletedRetention for tests.
 func (i *Invoker) ApplyCompletedRetention() {
 	i.applyCompletedRetention()
