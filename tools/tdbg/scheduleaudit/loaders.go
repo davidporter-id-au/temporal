@@ -12,6 +12,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
+	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/backoff"
 	"go.temporal.io/server/common/searchattribute/sadefs"
@@ -56,9 +57,10 @@ func (t *grpcRetrier) do(ctx context.Context, opName string, f func() error) err
 
 // NewGRPCScheduleLoader returns a ScheduleLoader backed by the workflow-service frontend. log receives rate-limit
 // retry lines; pass io.Discard to silence them. limiter paces describe requests, while listLimiter paces
-// ListSchedules requests. Pass nil to disable either limit.
-func NewGRPCScheduleLoader(client workflowservice.WorkflowServiceClient, log io.Writer, limiter, listLimiter *NamespaceRateLimiter) ScheduleLoader {
-	return &grpcScheduleLoader{client: client, retrier: &grpcRetrier{log: log}, limiter: limiter, listLimiter: listLimiter}
+// schedule-listing requests. Pass nil to disable either limit. includeV1 lists V1 and V2 schedules via ListSchedules;
+// otherwise only V2 (CHASM) schedules are listed, from visibility.
+func NewGRPCScheduleLoader(client workflowservice.WorkflowServiceClient, log io.Writer, limiter, listLimiter *NamespaceRateLimiter, includeV1 bool) ScheduleLoader {
+	return &grpcScheduleLoader{client: client, retrier: &grpcRetrier{log: log}, limiter: limiter, listLimiter: listLimiter, includeV1: includeV1}
 }
 
 type grpcScheduleLoader struct {
@@ -66,12 +68,24 @@ type grpcScheduleLoader struct {
 	retrier     *grpcRetrier
 	limiter     requestLimiter
 	listLimiter requestLimiter
+	// includeV1 lists every schedule via ListSchedules; otherwise only V2 (CHASM) schedules are listed.
+	includeV1 bool
 }
 
-// ListScheduleIDs pages through ListSchedules and calls yield with each schedule ID as pages arrive, so a caller can
-// begin describing/analyzing schedules without waiting for the full namespace listing. Describing each schedule
-// (LookupSchedule) is left to the caller, which fans it out concurrently.
+// V2ScheduleVisibilityQuery selects running V2 (CHASM) schedules. The explicit TemporalNamespaceDivision filter is
+// required, otherwise the visibility query converter appends "TemporalNamespaceDivision IS NULL" and excludes CHASM
+// executions. Migration sentinels have no Visibility component, so only genuine V2 schedules match.
+func V2ScheduleVisibilityQuery() string {
+	return fmt.Sprintf("TemporalNamespaceDivision = '%d' AND ExecutionStatus = 'Running'", chasm.SchedulerArchetypeID)
+}
+
+// ListScheduleIDs pages through the namespace's schedules and calls yield with each schedule ID as pages arrive, so a
+// caller can begin describing/analyzing schedules without waiting for the full namespace listing. Describing each
+// schedule (LookupSchedule) is left to the caller, which fans it out concurrently.
 func (l *grpcScheduleLoader) ListScheduleIDs(ctx context.Context, namespace string, yield func(id string) error) error {
+	if !l.includeV1 {
+		return l.listV2ScheduleIDs(ctx, namespace, yield)
+	}
 	var pageToken []byte
 	for {
 		var resp *workflowservice.ListSchedulesResponse
@@ -92,6 +106,40 @@ func (l *grpcScheduleLoader) ListScheduleIDs(ctx context.Context, namespace stri
 		}
 		for _, s := range resp.GetSchedules() {
 			if err := yield(s.GetScheduleId()); err != nil {
+				return err
+			}
+		}
+		if len(resp.GetNextPageToken()) == 0 {
+			return nil
+		}
+		pageToken = resp.GetNextPageToken()
+	}
+}
+
+// listV2ScheduleIDs pages the V2 schedules' visibility records. A CHASM scheduler's WorkflowId is its schedule ID.
+func (l *grpcScheduleLoader) listV2ScheduleIDs(ctx context.Context, namespace string, yield func(id string) error) error {
+	query := V2ScheduleVisibilityQuery()
+	var pageToken []byte
+	for {
+		var resp *workflowservice.ListWorkflowExecutionsResponse
+		err := l.retrier.do(ctx, fmt.Sprintf("ListWorkflowExecutions(%s/v2 schedules)", namespace), func() error {
+			if err := l.listLimiter.Wait(ctx, namespace); err != nil {
+				return err
+			}
+			var rpcErr error
+			resp, rpcErr = l.client.ListWorkflowExecutions(ctx, &workflowservice.ListWorkflowExecutionsRequest{
+				Namespace:     namespace,
+				PageSize:      visibilityPageSize,
+				NextPageToken: pageToken,
+				Query:         query,
+			})
+			return rpcErr
+		})
+		if err != nil {
+			return err
+		}
+		for _, e := range resp.GetExecutions() {
+			if err := yield(e.GetExecution().GetWorkflowId()); err != nil {
 				return err
 			}
 		}

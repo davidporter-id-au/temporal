@@ -13,6 +13,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
+	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/backoff"
 	"go.temporal.io/server/common/payload"
 	"google.golang.org/grpc"
@@ -66,7 +67,7 @@ func TestGRPCScheduleLoaderIncludesEntryWithoutInfo(t *testing.T) {
 	client := &scheduleWorkflowClient{response: &workflowservice.ListSchedulesResponse{
 		Schedules: []*schedulepb.ScheduleListEntry{{ScheduleId: "missing-info"}},
 	}}
-	loader := NewGRPCScheduleLoader(client, io.Discard, nil, nil)
+	loader := NewGRPCScheduleLoader(client, io.Discard, nil, nil, true)
 	var ids []string
 	require.NoError(t, loader.ListScheduleIDs(t.Context(), "ns", func(id string) error {
 		ids = append(ids, id)
@@ -91,6 +92,29 @@ func (c *executionWorkflowClient) ListWorkflowExecutions(
 	response := c.responses[0]
 	c.responses = c.responses[1:]
 	return response, nil
+}
+
+func TestGRPCScheduleLoaderListsOnlyV2ByDefault(t *testing.T) {
+	entry := func(id string) *workflowpb.WorkflowExecutionInfo {
+		return &workflowpb.WorkflowExecutionInfo{Execution: &commonpb.WorkflowExecution{WorkflowId: id}}
+	}
+	client := &executionWorkflowClient{responses: []*workflowservice.ListWorkflowExecutionsResponse{
+		{Executions: []*workflowpb.WorkflowExecutionInfo{entry("v2-a")}, NextPageToken: []byte("next")},
+		{Executions: []*workflowpb.WorkflowExecutionInfo{entry("v2-b")}},
+	}}
+	loader := NewGRPCScheduleLoader(client, io.Discard, nil, nil, false)
+
+	var ids []string
+	require.NoError(t, loader.ListScheduleIDs(t.Context(), "ns", func(id string) error {
+		ids = append(ids, id)
+		return nil
+	}))
+	require.Equal(t, []string{"v2-a", "v2-b"}, ids)
+	require.Len(t, client.requests, 2)
+	require.Equal(t, []byte("next"), client.requests[1].GetNextPageToken())
+	require.Equal(t, int32(visibilityPageSize), client.requests[0].GetPageSize())
+	require.Equal(t, fmt.Sprintf("TemporalNamespaceDivision = '%d' AND ExecutionStatus = 'Running'", chasm.SchedulerArchetypeID),
+		client.requests[0].GetQuery())
 }
 
 func TestGRPCExecutionLoaderRateLimitsEveryRetry(t *testing.T) {
@@ -125,7 +149,7 @@ func TestGRPCLoaderRateLimiters(t *testing.T) {
 	describeLimiter := NewNamespaceRateLimiter(10)
 	listLimiter := NewNamespaceRateLimiter(2)
 
-	schedules := NewGRPCScheduleLoader(nil, io.Discard, describeLimiter, listLimiter).(*grpcScheduleLoader)
+	schedules := NewGRPCScheduleLoader(nil, io.Discard, describeLimiter, listLimiter, false).(*grpcScheduleLoader)
 	require.Same(t, describeLimiter, schedules.limiter)
 	require.Same(t, listLimiter, schedules.listLimiter)
 

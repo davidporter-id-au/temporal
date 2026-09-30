@@ -45,6 +45,7 @@ type row struct {
 		DelayedOverlap      int `json:"delayed_overlap"`
 		RealMiss            int `json:"real_miss"`
 		SkipOverlap         int `json:"skip_overlap"`
+		SkipLateBlocker     int `json:"skip_late_blocker"`
 		Pending             int `json:"pending"`
 		AwaitingStart       int `json:"awaiting_start"`
 		InconclusiveOverlap int `json:"inconclusive_overlap"`
@@ -94,25 +95,43 @@ type delayRow struct {
 	E2EDelay      string `json:"e2e_delay"`
 }
 
-// RowWriter streams one JSON object per flagged schedule to an underlying writer. A schedule is flagged when it has
-// missed times, or -- when delayThreshold > 0 -- when some started action's dispatch delay reaches delayThreshold
-// (surfacing schedules the system was slow to start even though nothing was missed). A single RowWriter is meant to be
-// driven from one goroutine (e.g. the Auditor's collector).
+// expectedMissCategories are misses the scheduler produces by design (an overlap policy doing its job, or a fire too
+// recent to judge). On their own they don't flag a schedule; they're still emitted as context on a flagged row.
+var expectedMissCategories = map[string]bool{
+	categorySkipOverlap:   true,
+	categoryPending:       true,
+	categoryAwaitingStart: true,
+}
+
+// RowWriter streams one JSON object per flagged schedule to an underlying writer. A schedule is flagged when its audit
+// is inconclusive (except a jitter-seed audit that matched every scheduled time), when it has a miss outside
+// expectedMissCategories, with includeExpected when it has any expected outcome, or -- when
+// delayThreshold > 0 -- when some started action's dispatch delay reaches delayThreshold (surfacing schedules the
+// system was slow to start even though nothing was missed). A single RowWriter is meant to be driven from one
+// goroutine (e.g. the Auditor's collector).
 type RowWriter struct {
-	enc            *json.Encoder
-	delayThreshold time.Duration
+	enc             *json.Encoder
+	delayThreshold  time.Duration
+	includeExpected bool
+	suppressed      int
 }
 
 // NewRowWriter returns a RowWriter. delayThreshold flags otherwise-clean schedules whose worst dispatch delay reaches
-// it; pass 0 to flag on missed times only.
-func NewRowWriter(w io.Writer, delayThreshold time.Duration) *RowWriter {
-	return &RowWriter{enc: json.NewEncoder(w), delayThreshold: delayThreshold}
+// it; pass 0 to flag on missed times only. includeExpected also flags schedules whose only outcomes are expected.
+func NewRowWriter(w io.Writer, delayThreshold time.Duration, includeExpected bool) *RowWriter {
+	return &RowWriter{enc: json.NewEncoder(w), delayThreshold: delayThreshold, includeExpected: includeExpected}
 }
+
+// Suppressed is how many schedules weren't written because everything they had to report was expected.
+func (rw *RowWriter) Suppressed() int { return rw.suppressed }
 
 // Write emits one row for r if it is flagged and reports whether it did; for an unflagged schedule it is a no-op and
 // returns false.
 func (rw *RowWriter) Write(r Result) (bool, error) {
 	if !rw.flagged(r) {
+		if hasExpectedOutcome(r) {
+			rw.suppressed++
+		}
 		return false, nil
 	}
 	if err := rw.enc.Encode(toRow(r)); err != nil {
@@ -122,13 +141,41 @@ func (rw *RowWriter) Write(r Result) (bool, error) {
 }
 
 func (rw *RowWriter) flagged(r Result) bool {
-	if r.auditStatus() != auditStatusComplete {
+	if rw.delayThreshold > 0 && r.MaxDispatchDelay() >= rw.delayThreshold {
 		return true
 	}
-	if r.TotalMissed() > 0 {
+	if rw.includeExpected && hasExpectedOutcome(r) {
 		return true
 	}
-	return rw.delayThreshold > 0 && r.MaxDispatchDelay() >= rw.delayThreshold
+	if r.auditStatus() != auditStatusComplete && !jitterSeedFullyMatched(r) {
+		return true
+	}
+	for _, category := range r.Missed {
+		if !expectedMissCategories[category] {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExpectedOutcome reports whether r has something worth reporting only with --include-expected: a miss in an
+// expected category, or a jitter-seed audit whose every scheduled time matched.
+func hasExpectedOutcome(r Result) bool {
+	if jitterSeedFullyMatched(r) {
+		return true
+	}
+	for _, category := range r.Missed {
+		if expectedMissCategories[category] {
+			return true
+		}
+	}
+	return false
+}
+
+// jitterSeedFullyMatched: the unknown seed only moves fire times, and matching is by nominal time, so a jitter-seed
+// audit where every scheduled time found its workflow has nothing inconclusive left to report.
+func jitterSeedFullyMatched(r Result) bool {
+	return r.auditStatus() == auditStatusInconclusiveJitterSeed && r.Matched == r.Expected
 }
 
 func toRow(r Result) row {
@@ -155,6 +202,7 @@ func toRow(r Result) row {
 
 	out.Counts.RealMiss = r.Count(categoryRealMiss)
 	out.Counts.SkipOverlap = r.Count(categorySkipOverlap)
+	out.Counts.SkipLateBlocker = r.Count(categorySkipLateBlocker)
 	out.Counts.Pending = r.Count(categoryPending)
 	out.Counts.AwaitingStart = r.Count(categoryAwaitingStart)
 	out.Counts.InconclusiveOverlap = r.Count(categoryInconclusiveOverlap)

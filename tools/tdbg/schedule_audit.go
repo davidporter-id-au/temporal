@@ -39,13 +39,13 @@ func AdminAuditSchedules(c *cli.Context, factory ClientFactory) error {
 		IncludePaused:  in.IncludePaused,
 		DelayThreshold: in.DelayThreshold,
 		Progress:       progress,
-		Schedules:      scheduleaudit.NewGRPCScheduleLoader(wfClient, progress, limiter, listLimiter),
+		Schedules:      scheduleaudit.NewGRPCScheduleLoader(wfClient, progress, limiter, listLimiter, in.IncludeV1),
 		Executions:     scheduleaudit.NewGRPCExecutionLoader(wfClient, progress, listLimiter),
 		Stats:          stats,
 	}
 
 	auditStart := time.Now()
-	rw := scheduleaudit.NewRowWriter(os.Stdout, in.DelayThreshold)
+	rw := scheduleaudit.NewRowWriter(os.Stdout, in.DelayThreshold, in.IncludeExpected)
 	var flagged int
 
 	g, ctx := errgroup.WithContext(c.Context)
@@ -68,8 +68,8 @@ func AdminAuditSchedules(c *cli.Context, factory ClientFactory) error {
 	}
 	summary := stats.Snapshot()
 	_, _ = fmt.Fprintf(progress,
-		"audit complete: %d listed, %d audited, %d skipped, %d flagged in %s\n",
-		summary.Listed, summary.Audited, summary.Skipped, flagged, time.Since(auditStart).Round(time.Second))
+		"audit complete: %d listed, %d audited, %d skipped, %d flagged, %d suppressed (expected-only) in %s\n",
+		summary.Listed, summary.Audited, summary.Skipped, flagged, rw.Suppressed(), time.Since(auditStart).Round(time.Second))
 	return nil
 }
 
@@ -91,26 +91,30 @@ type auditInputs struct {
 	WindowEnd   time.Time
 	AsOf        time.Time
 
-	Concurrency    int
-	RPS            int
-	ListRPS        int
-	DelayThreshold time.Duration
-	IncludePaused  bool
-	Quiet          bool
+	Concurrency     int
+	RPS             int
+	ListRPS         int
+	DelayThreshold  time.Duration
+	IncludePaused   bool
+	IncludeV1       bool
+	IncludeExpected bool
+	Quiet           bool
 }
 
 func parseAuditInputs(c *cli.Context) (*auditInputs, error) {
 	in := &auditInputs{
-		Namespace:      c.String(FlagNamespace),
-		ScheduleID:     c.String(FlagScheduleID),
-		File:           c.String(FlagFile),
-		Stdin:          os.Stdin,
-		Concurrency:    c.Int(FlagConcurrency),
-		RPS:            c.Int(FlagRPS),
-		ListRPS:        c.Int(FlagListRPS),
-		DelayThreshold: c.Duration(FlagDelayThreshold),
-		IncludePaused:  c.Bool(FlagIncludePaused),
-		Quiet:          c.Bool(FlagQuiet),
+		Namespace:       c.String(FlagNamespace),
+		ScheduleID:      c.String(FlagScheduleID),
+		File:            c.String(FlagFile),
+		Stdin:           os.Stdin,
+		Concurrency:     c.Int(FlagConcurrency),
+		RPS:             c.Int(FlagRPS),
+		ListRPS:         c.Int(FlagListRPS),
+		DelayThreshold:  c.Duration(FlagDelayThreshold),
+		IncludePaused:   c.Bool(FlagIncludePaused),
+		IncludeV1:       c.Bool(FlagIncludeV1),
+		IncludeExpected: c.Bool(FlagIncludeExpected),
+		Quiet:           c.Bool(FlagQuiet),
 	}
 	if in.Concurrency <= 0 {
 		in.Concurrency = 1

@@ -82,7 +82,7 @@ func TestRowWriter(t *testing.T) {
 	t.Run("emits schedule-level inconclusive result without misses", func(t *testing.T) {
 		result := Result{Namespace: "ns1", ScheduleID: "changed", AuditStatus: auditStatusInconclusiveScheduleChanged}
 		var buf bytes.Buffer
-		wrote, err := NewRowWriter(&buf, 0).Write(result)
+		wrote, err := NewRowWriter(&buf, 0, false).Write(result)
 		require.NoError(t, err)
 		require.True(t, wrote)
 		require.Contains(t, buf.String(), `"audit_status":"inconclusive_schedule_changed"`)
@@ -95,6 +95,68 @@ func TestRowWriter(t *testing.T) {
 		require.Empty(t, buf.String())
 	})
 
+	t.Run("expected-only misses are suppressed unless included", func(t *testing.T) {
+		t1 := mustParseTime("2026-05-19T19:00:00Z")
+		t2 := mustParseTime("2026-05-19T20:00:00Z")
+		tests := []struct {
+			name            string
+			missed          map[time.Time]string
+			status          string
+			expected        int
+			matched         int
+			includeExpected bool
+			wantWrote       bool
+			wantSuppressed  int
+		}{
+			{name: "skip_overlap only", missed: map[time.Time]string{t1: categorySkipOverlap}, wantSuppressed: 1},
+			{name: "pending only", missed: map[time.Time]string{t1: categoryPending}, wantSuppressed: 1},
+			{name: "awaiting_start only", missed: map[time.Time]string{t1: categoryAwaitingStart}, wantSuppressed: 1},
+			{name: "included expected", missed: map[time.Time]string{t1: categorySkipOverlap}, includeExpected: true, wantWrote: true},
+			{name: "skip_late_blocker flags", missed: map[time.Time]string{t1: categorySkipLateBlocker}, wantWrote: true},
+			{name: "paused flags", missed: map[time.Time]string{t1: categoryPaused}, wantWrote: true},
+			{name: "inconclusive_overlap flags", missed: map[time.Time]string{t1: categoryInconclusiveOverlap}, wantWrote: true},
+			{name: "mixed flags", missed: map[time.Time]string{t1: categoryRealMiss, t2: categorySkipOverlap}, wantWrote: true},
+			{name: "no misses is not counted as suppressed", missed: map[time.Time]string{}},
+			{name: "jitter seed fully matched", status: auditStatusInconclusiveJitterSeed, expected: 2, matched: 2, wantSuppressed: 1},
+			{name: "jitter seed fully matched, included", status: auditStatusInconclusiveJitterSeed, expected: 2, matched: 2, includeExpected: true, wantWrote: true},
+			{name: "jitter seed with unmatched time flags", status: auditStatusInconclusiveJitterSeed, expected: 2, matched: 1, wantWrote: true},
+			{name: "schedule changed flags", status: auditStatusInconclusiveScheduleChanged, expected: 2, matched: 2, wantWrote: true},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				var buf bytes.Buffer
+				rw := NewRowWriter(&buf, 0, tc.includeExpected)
+				wrote, err := rw.Write(Result{
+					Namespace: "ns1", ScheduleID: "s1", Missed: tc.missed,
+					AuditStatus: tc.status, Expected: tc.expected, Matched: tc.matched,
+				})
+				require.NoError(t, err)
+				require.Equal(t, tc.wantWrote, wrote)
+				require.Equal(t, tc.wantWrote, buf.Len() > 0)
+				require.Equal(t, tc.wantSuppressed, rw.Suppressed())
+			})
+		}
+	})
+
+	t.Run("mixed row carries expected misses as context", func(t *testing.T) {
+		t1 := mustParseTime("2026-05-19T19:00:00Z")
+		t2 := mustParseTime("2026-05-19T20:00:00Z")
+		var buf bytes.Buffer
+		_, err := NewRowWriter(&buf, 0, false).Write(Result{
+			Namespace: "ns1", ScheduleID: "s1",
+			Missed: map[time.Time]string{t1: categorySkipLateBlocker, t2: categorySkipOverlap},
+		})
+		require.NoError(t, err)
+		var got row
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+		require.Equal(t, 1, got.Counts.SkipLateBlocker)
+		require.Equal(t, 1, got.Counts.SkipOverlap)
+		require.Equal(t, []missRow{
+			{Nominal: t1, Category: categorySkipLateBlocker},
+			{Nominal: t2, Category: categorySkipOverlap},
+		}, got.Misses)
+	})
+
 	t.Run("delay threshold flags a slow schedule with no missed times", func(t *testing.T) {
 		slow := Result{
 			Namespace: "ns1", ScheduleID: "slow",
@@ -102,7 +164,7 @@ func TestRowWriter(t *testing.T) {
 		}
 		emit := func(threshold time.Duration) string {
 			var buf bytes.Buffer
-			rw := NewRowWriter(&buf, threshold)
+			rw := NewRowWriter(&buf, threshold, false)
 			_, err := rw.Write(slow)
 			require.NoError(t, err)
 			return buf.String()
@@ -159,7 +221,7 @@ func TestRowWriter(t *testing.T) {
 }
 
 func writeResults(w io.Writer, results []Result) error {
-	rw := NewRowWriter(w, 0)
+	rw := NewRowWriter(w, 0, false)
 	for _, result := range results {
 		if _, err := rw.Write(result); err != nil {
 			return err

@@ -231,6 +231,70 @@ func TestClassify(t *testing.T) {
 		require.Equal(t, categorySkipOverlap, r.Missed[mustParseTime("2026-05-19T19:00:00Z")])
 	})
 
+	t.Run("drops policy skip attribution by blocker start", func(t *testing.T) {
+		running := func(nominal, start string) Execution {
+			return Execution{
+				WorkflowID: "blocker", NominalTime: mustParseTime(nominal), StartTime: mustParseTime(start),
+				Status: enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			}
+		}
+		fire := func(at string) ScheduledTime {
+			return ScheduledTime{Nominal: mustParseTime(at), Jittered: mustParseTime(at)}
+		}
+		tests := []struct {
+			name    string
+			policy  enumspb.ScheduleOverlapPolicy
+			blocker Execution
+			fires   []ScheduledTime
+			want    []string
+		}{
+			{
+				name:    "blocker started late, after the fire -> skip_late_blocker",
+				policy:  enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+				blocker: running("2026-05-19T18:00:00Z", "2026-05-19T19:30:00Z"),
+				fires:   []ScheduledTime{fire("2026-05-19T19:00:00Z")},
+				want:    []string{categorySkipLateBlocker},
+			},
+			{
+				name:    "blocker started after the fire but within threshold -> skip_overlap",
+				policy:  enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+				blocker: running("2026-05-19T19:00:00Z", "2026-05-19T19:00:40Z"),
+				fires:   []ScheduledTime{fire("2026-05-19T19:00:30Z")},
+				want:    []string{categorySkipOverlap},
+			},
+			{
+				name:    "late blocker already running at the fire -> skip_overlap",
+				policy:  enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+				blocker: running("2026-05-19T18:00:00Z", "2026-05-19T18:30:00Z"),
+				fires:   []ScheduledTime{fire("2026-05-19T19:00:00Z")},
+				want:    []string{categorySkipOverlap},
+			},
+			{
+				name:    "unspecified resolves to skip",
+				policy:  enumspb.SCHEDULE_OVERLAP_POLICY_UNSPECIFIED,
+				blocker: running("2026-05-19T18:00:00Z", "2026-05-19T19:30:00Z"),
+				fires:   []ScheduledTime{fire("2026-05-19T19:00:00Z")},
+				want:    []string{categorySkipLateBlocker},
+			},
+			{
+				name:    "buffer one drop behind a late blocker -> skip_late_blocker",
+				policy:  enumspb.SCHEDULE_OVERLAP_POLICY_BUFFER_ONE,
+				blocker: running("2026-05-19T18:00:00Z", "2026-05-19T21:30:00Z"),
+				fires:   []ScheduledTime{fire("2026-05-19T19:00:00Z"), fire("2026-05-19T20:00:00Z")},
+				want:    []string{categoryPending, categorySkipLateBlocker},
+			},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				r := &Result{}
+				classify(r, tc.fires, startedWorkflows{}, groupExecutions([]Execution{tc.blocker}), tc.policy)
+				for i, f := range tc.fires {
+					require.Equal(t, tc.want[i], r.Missed[f.Nominal], f.Nominal)
+				}
+			})
+		}
+	})
+
 	t.Run("buffering policy + running blocker -> pending", func(t *testing.T) {
 		sw := startedWorkflows{}
 		// Same active workflow, but BUFFER_ALL never drops: the 19:00 fire should have run later, so it's a real miss.
@@ -323,6 +387,61 @@ func TestClassify(t *testing.T) {
 		classify(r, fires, groupExecutions([]Execution{buffered}), groupExecutions([]Execution{blocker, buffered}), enumspb.SCHEDULE_OVERLAP_POLICY_BUFFER_ONE)
 		require.Equal(t, 1, r.Matched)
 		require.Equal(t, categorySkipOverlap, r.Missed[fires[1].Nominal])
+	})
+
+	t.Run("buffer one occupancy at window start", func(t *testing.T) {
+		at := mustParseTime
+		closed := func(id, nominal, start, closeAt string) Execution {
+			c := at(closeAt)
+			return Execution{WorkflowID: id, NominalTime: at(nominal), StartTime: at(start), CloseTime: &c,
+				Status: enumspb.WORKFLOW_EXECUTION_STATUS_TIMED_OUT}
+		}
+		running := func(id, nominal, start string) Execution {
+			return Execution{WorkflowID: id, NominalTime: at(nominal), StartTime: at(start),
+				Status: enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING}
+		}
+		fires := []ScheduledTime{
+			{Nominal: at("2026-05-19T18:30:00Z"), Jittered: at("2026-05-19T18:30:00Z")},
+			{Nominal: at("2026-05-19T19:00:00Z"), Jittered: at("2026-05-19T19:00:00Z")},
+		}
+		tests := []struct {
+			name   string
+			active []Execution
+			want   []string
+		}{
+			{
+				name: "pre-window action queued behind the blocker -> buffer was full",
+				active: []Execution{
+					closed("blocker", "2026-05-19T17:00:00Z", "2026-05-19T17:00:00Z", "2026-05-19T19:30:00Z"),
+					running("queued", "2026-05-19T17:30:00Z", "2026-05-19T19:30:00Z"),
+				},
+				want: []string{categorySkipOverlap, categorySkipOverlap},
+			},
+			{
+				name:   "blocker closed long ago with nothing queued -> buffer was empty, first fire is a miss",
+				active: []Execution{closed("blocker", "2026-05-19T17:00:00Z", "2026-05-19T17:00:00Z", "2026-05-19T19:30:00Z")},
+				want:   []string{categoryRealMiss, categorySkipOverlap},
+			},
+			{
+				name:   "blocker still running -> unknown",
+				active: []Execution{running("blocker", "2026-05-19T17:00:00Z", "2026-05-19T17:00:00Z")},
+				want:   []string{categoryInconclusiveOverlap, categoryInconclusiveOverlap},
+			},
+			{
+				name:   "blocker closed too recently to trust the missing successor -> unknown",
+				active: []Execution{closed("blocker", "2026-05-19T17:00:00Z", "2026-05-19T17:00:00Z", "2026-05-19T21:59:30Z")},
+				want:   []string{categoryInconclusiveOverlap, categoryInconclusiveOverlap},
+			},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				r := &Result{WindowStart: at("2026-05-19T18:00:00Z"), AsOf: at("2026-05-19T22:00:00Z"), DelayThreshold: time.Minute}
+				classify(r, fires, startedWorkflows{}, groupExecutions(tc.active), enumspb.SCHEDULE_OVERLAP_POLICY_BUFFER_ONE)
+				for i, f := range fires {
+					require.Equal(t, tc.want[i], r.Missed[f.Nominal], f.Nominal)
+				}
+			})
+		}
 	})
 
 	t.Run("buffer one at window boundary is inconclusive", func(t *testing.T) {

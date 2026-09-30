@@ -94,6 +94,8 @@ var (
 	FlagListRPS                    = "list-rps"
 	FlagDelayThreshold             = "delay-threshold"
 	FlagIncludePaused              = "include-paused"
+	FlagIncludeV1                  = "include-v1"
+	FlagIncludeExpected            = "include-expected"
 	FlagQuiet                      = "quiet"
 )
 

@@ -370,11 +370,20 @@ func newAdminScheduleCommands(clientFactory ClientFactory) []*cli.Command {
 produced in the audit window, and classifies each against actual workflow executions found in visibility.
 Designed to answer: did the scheduler start workflows when it should have, during a specific time range?
 
+SCOPE
+  A namespace target audits only V2 (CHASM) schedules unless --include-v1 is set. A named --schedule-id (flag or
+  stream) is audited regardless of version.
+
 Input and output both stream: schedules are described and filtered as they page in, then visibility is queried in
 bounded batches of 25 and results are classified, so large namespaces use bounded memory without one query per schedule.
 
 OUTPUT FORMAT
   JSONL streamed to stdout: one self-contained JSON object per flagged schedule (redirect to a file if desired).
+  A schedule is flagged when its audit is inconclusive, when it has a miss the scheduler didn't produce by design
+  (anything but skip_overlap, pending, awaiting_start), or on --delay-threshold. Schedules whose only outcomes are
+  expected -- including an inconclusive_jitter_seed audit that matched every scheduled time -- are counted as
+  suppressed on stderr; --include-expected emits them too. A flagged row always carries
+  every miss, expected ones included, as context.
   Rows are emitted in completion order (NOT sorted) as each schedule finishes; pipe through 'sort' or 'jq -s' if you
   need a stable order. Each object is the full analysis result -- identity, audit window, every input used, and the
   classification -- so a verdict can be inspected or replayed offline. Fields:
@@ -394,20 +403,27 @@ OUTPUT FORMAT
     create_time, update_time       schedule create/update times (null if unknown)
     expected, actual, matched      scheduled times; unique workflows observed; scheduled times matched to a workflow
     missed                         total unmatched scheduled times
-    counts {on_time, late, delayed_overlap, real_miss, skip_overlap, pending, awaiting_start,
+    counts {on_time, late, delayed_overlap, real_miss, skip_overlap, skip_late_blocker, pending, awaiting_start,
             inconclusive_overlap, paused}
     misses [{nominal, category}]   every unmatched scheduled time and why:
                                      real_miss                      no workflow and the policy doesn't justify a skip
                                                                     (a delays/concurrent policy, or a drops policy with
                                                                     nothing running). Warrants investigation.
                                      skip_overlap                   a drops policy legitimately skipped because a prior
-                                                                    workflow was still running
+                                                                    workflow was still running (expected)
+                                     skip_late_blocker              a drops policy skipped behind a prior workflow that
+                                                                    only overlapped because it started late (it wasn't
+                                                                    running yet at the fire and trailed its own
+                                                                    eligibility by the late threshold). The signature of
+                                                                    a scheduler stall. Warrants investigation.
                                      pending                        a buffering/canceling policy is still waiting on a
-                                                                    currently-running workflow
+                                                                    currently-running workflow (expected)
                                      awaiting_start                 the fire is still inside the effective late threshold
-                                                                    and is too recent to judge as missing
-					                 inconclusive_overlap            overlap ordering cannot be reconstructed uniquely,
-					                                                 or historical BufferOne occupancy is unknown
+                                                                    and is too recent to judge as missing (expected)
+                                     inconclusive_overlap           overlap ordering cannot be reconstructed uniquely,
+                                                                    or BufferOne occupancy at the window start is
+                                                                    unknown (the action running then is still open, or
+                                                                    closed too recently to trust visibility)
                                      paused                         schedule was paused before the window; benign
                                                                     (only with --include-paused)
     scheduled_times [{nominal, jittered}]  every reconstructed fire in the window
@@ -437,7 +453,8 @@ CAVEATS AND LIMITATIONS
 
   Jittered schedules: legacy V1 schedules used a different jitter seed and DescribeSchedule does not expose which seed
     produced a historical interval. These are emitted with audit_status=inconclusive_jitter_seed instead of making a
-    seed-dependent miss or overlap claim.
+    seed-dependent miss or overlap claim. Matching is by nominal time, so one that matched every scheduled time is
+    treated as expected and suppressed unless --include-expected.
 
   Paused / exhausted schedules: exhausted schedules are always dropped. Paused schedules are dropped unless
     --include-paused, which audits them and classifies unmatched times as 'paused' (benign) -- or as
@@ -448,7 +465,8 @@ CAVEATS AND LIMITATIONS
     outage" from "brief blip + tight catchup".
 
   Catchup under overlap=SKIP after a brief outage: when the V1 scheduler resumes with multiple queued actions, it
-    dispatches only the oldest and discards the rest. The audit reports the discarded actions as real_miss. A burst of
+    dispatches only the oldest and discards the rest. The audit reports the discarded actions as real_miss, or as
+    skip_late_blocker when they were dropped behind that late-started oldest action. A burst of
     real_miss across many schedules within minutes typically indicates this behavior. To confirm, the user must:
     (1) ListWorkflowExecutions with WorkflowId='temporal-sys-scheduler:<schedule_id>' and
     TemporalNamespaceDivision='TemporalScheduler' to find the scheduler workflow run active during the window;
@@ -560,6 +578,15 @@ EXAMPLES
 					Name: FlagIncludePaused,
 					Usage: "Audit currently-paused schedules too (excluded by default). Their unmatched times are " +
 						"classified 'paused' rather than real_miss, or the audit is inconclusive_schedule_changed if paused mid-window.",
+				},
+				&cli.BoolFlag{
+					Name:  FlagIncludeV1,
+					Usage: "Audit V1 (workflow-backed) schedules too when listing a namespace. By default only V2 (CHASM) schedules are listed.",
+				},
+				&cli.BoolFlag{
+					Name: FlagIncludeExpected,
+					Usage: "Also emit schedules whose only misses are expected (skip_overlap, pending, awaiting_start). " +
+						"By default these are suppressed and only counted on stderr.",
 				},
 				&cli.BoolFlag{
 					Name:  FlagQuiet,

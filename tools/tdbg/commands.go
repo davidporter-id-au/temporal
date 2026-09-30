@@ -35,6 +35,7 @@ import (
 	"go.temporal.io/server/service/history/tasks"
 	"go.temporal.io/server/service/worker/dummy"
 	"go.temporal.io/server/service/worker/scheduler"
+	"go.temporal.io/server/tools/tdbg/scheduleaudit"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -946,10 +947,8 @@ func v1ScheduleVisibilityQuery() string {
 }
 
 // v2ScheduleVisibilityQuery returns the visibility query selecting running V2 (CHASM) schedules.
-// The explicit TemporalNamespaceDivision filter is required, otherwise the visibility query
-// converter appends "TemporalNamespaceDivision IS NULL" and excludes CHASM executions.
 func v2ScheduleVisibilityQuery() string {
-	return fmt.Sprintf("TemporalNamespaceDivision = '%d' AND ExecutionStatus = 'Running'", chasm.SchedulerArchetypeID)
+	return scheduleaudit.V2ScheduleVisibilityQuery()
 }
 
 // AdminScheduleStatus reports how many schedules in --namespace are currently V1

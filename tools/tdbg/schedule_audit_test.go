@@ -2,6 +2,7 @@ package tdbg
 
 import (
 	"context"
+	"flag"
 	"io"
 	"os"
 	"path/filepath"
@@ -149,6 +150,42 @@ func TestAuditCommandIsRegistered(t *testing.T) {
 		}
 	}
 	require.NotNil(t, quiet, "audit quiet flag not registered")
+}
+
+func TestParseAuditInputsScopeFlags(t *testing.T) {
+	app := NewCliApp()
+	var audit *cli.Command
+	for _, top := range app.Commands {
+		for _, ss := range top.Subcommands {
+			if top.Name == "schedule" && ss.Name == "audit" {
+				audit = ss
+			}
+		}
+	}
+	require.NotNil(t, audit)
+
+	tests := []struct {
+		name                 string
+		args                 []string
+		wantV1, wantExpected bool
+	}{
+		{name: "defaults to v2-only, unexpected-only", args: nil},
+		{name: "include v1", args: []string{"--" + FlagIncludeV1}, wantV1: true},
+		{name: "include expected", args: []string{"--" + FlagIncludeExpected}, wantExpected: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			set := flag.NewFlagSet("audit", flag.ContinueOnError)
+			for _, f := range audit.Flags {
+				require.NoError(t, f.Apply(set))
+			}
+			require.NoError(t, set.Parse(append([]string{"--" + FlagNamespace, "ns", "--" + FlagStart, "1h"}, tc.args...)))
+			in, err := parseAuditInputs(cli.NewContext(app, set, nil))
+			require.NoError(t, err)
+			require.Equal(t, tc.wantV1, in.IncludeV1)
+			require.Equal(t, tc.wantExpected, in.IncludeExpected)
+		})
+	}
 }
 
 func TestAuditProgress(t *testing.T) {

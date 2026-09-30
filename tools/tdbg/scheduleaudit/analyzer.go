@@ -203,6 +203,16 @@ func (s startedWorkflows) blockingPredecessor(
 	return blocker, ambiguous
 }
 
+// startedLate reports whether blocker only overlapped fireTime because it started late: it wasn't yet running at
+// fireTime and its start trailed its own eligibility by at least lateThreshold. That's the stall signature (T1 starts
+// late, T2..Tn get dropped behind it), which must not be mistaken for an ordinary overlap skip.
+func (s startedWorkflows) startedLate(blocker *startedWorkflow, fireTime time.Time, lateThreshold time.Duration) bool {
+	if blocker == nil || blocker.activeAt(fireTime) {
+		return false
+	}
+	return blocker.ChainStart.Sub(s.desiredTime(blocker, blocker.NominalTime)) >= lateThreshold
+}
+
 // desiredTime reconstructs serial overlap eligibility from every earlier scheduled action. Considering actions by
 // nominal order captures a BufferAll queue where an intermediate action starts after this action's fire time.
 func (s startedWorkflows) desiredTime(self *startedWorkflow, actual time.Time) time.Time {
@@ -287,6 +297,7 @@ func classify(r *Result, scheduled []ScheduledTime, inWindow, active startedWork
 	r.Expected = len(scheduled)
 	r.Actual = len(inWindow)
 
+	lateThreshold := effectiveLateThreshold(r.DelayThreshold)
 	policy = resolveOverlapPolicy(policy)
 	if policy == enumspb.SCHEDULE_OVERLAP_POLICY_CANCEL_OTHER || policy == enumspb.SCHEDULE_OVERLAP_POLICY_TERMINATE_OTHER {
 		classifyReplacingPolicy(r, scheduled, inWindow, active)
@@ -295,8 +306,7 @@ func classify(r *Result, scheduled []ScheduledTime, inWindow, active startedWork
 	var bufferOne bufferOneState
 	if policy == enumspb.SCHEDULE_OVERLAP_POLICY_BUFFER_ONE {
 		if blocker := active.blockingAt(r.WindowStart); blocker != nil {
-			bufferOne.unknown = true
-			bufferOne.until = blocker.ChainEnd
+			bufferOne.resolveWindowStart(active, blocker, r.WindowStart, r.AsOf.Add(-lateThreshold))
 		}
 	}
 	for _, st := range scheduled {
@@ -317,7 +327,7 @@ func classify(r *Result, scheduled []ScheduledTime, inWindow, active startedWork
 			r.Missed[st.Nominal] = categoryInconclusiveOverlap
 			continue
 		}
-		r.Missed[st.Nominal] = classifyUnmatched(policy, blocker, &bufferOne)
+		r.Missed[st.Nominal] = classifyUnmatched(policy, blocker, &bufferOne, active.startedLate(blocker, fireTime, lateThreshold))
 	}
 }
 
@@ -333,6 +343,22 @@ func (b *bufferOneState) advance(at time.Time) {
 	}
 	if b.unknown && !b.until.IsZero() && !at.Before(b.until) {
 		b.unknown = false
+	}
+}
+
+// resolveWindowStart reconstructs BufferOne occupancy behind blocker, the action running at windowStart. A pre-window
+// action queued behind it is still alive at windowStart, so it's in active: finding one means the buffer was full.
+// Finding none is only conclusive once blocker closed long enough before settledBy for its successor to be visible.
+func (b *bufferOneState) resolveWindowStart(active startedWorkflows, blocker *startedWorkflow, windowStart, settledBy time.Time) {
+	b.until = blocker.ChainEnd
+	for _, w := range active {
+		if w != blocker && w.NominalTime.After(blocker.NominalTime) && !w.NominalTime.After(windowStart) {
+			b.occupied = true
+			return
+		}
+	}
+	if blocker.StillRunning || !blocker.ChainEnd.Before(settledBy) {
+		b.unknown = true
 	}
 }
 
@@ -364,18 +390,23 @@ func classifyUnmatched(
 	policy enumspb.ScheduleOverlapPolicy,
 	blocker *startedWorkflow,
 	bufferOne *bufferOneState,
+	lateBlocker bool,
 ) string {
+	skip := categorySkipOverlap
+	if lateBlocker {
+		skip = categorySkipLateBlocker
+	}
 	switch policy {
 	case enumspb.SCHEDULE_OVERLAP_POLICY_SKIP:
 		if blocker != nil {
-			return categorySkipOverlap
+			return skip
 		}
 	case enumspb.SCHEDULE_OVERLAP_POLICY_BUFFER_ONE:
 		if bufferOne.unknown {
 			return categoryInconclusiveOverlap
 		}
 		if bufferOne.occupied {
-			return categorySkipOverlap
+			return skip
 		}
 		if blocker != nil {
 			bufferOne.occupy(blocker)
@@ -608,11 +639,13 @@ const (
 	auditStatusInconclusiveScheduleChanged = "inconclusive_schedule_changed"
 	auditStatusInconclusiveJitterSeed      = "inconclusive_jitter_seed"
 
-	categoryOnTime              = "on_time"
-	categoryLate                = "late"
-	categoryDelayedOverlap      = "delayed_overlap"
-	categoryRealMiss            = "real_miss"
-	categorySkipOverlap         = "skip_overlap"
+	categoryOnTime         = "on_time"
+	categoryLate           = "late"
+	categoryDelayedOverlap = "delayed_overlap"
+	categoryRealMiss       = "real_miss"
+	categorySkipOverlap    = "skip_overlap"
+	// categorySkipLateBlocker is a drop behind a blocker that only overlapped because it started late.
+	categorySkipLateBlocker     = "skip_late_blocker"
 	categoryPending             = "pending"
 	categoryAwaitingStart       = "awaiting_start"
 	categoryInconclusiveOverlap = "inconclusive_overlap"
